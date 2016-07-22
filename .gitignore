@@ -115,3 +115,9 @@ objsamples/[Rr]elease/
 
 objsamples/FuelSDK_config.xml
 FuelSDK-CSharp/fixer.awk
+/src/FuelSDK-CSharp/bin/Debug
+/src/objsamples/bin/Debug
+/src/objsamples/FuelSDK_config.xml
+/src/objsamples/project.lock.json
+/src/FuelSDK-CSharp/project.lock.json
+/.vs/

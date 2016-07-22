@@ -11,7 +11,13 @@ using System.Net;
 using System.IO;
 using System.Xml.Linq;
 using System.ServiceModel.Channels;
+#if NET35
 using JWT;
+#else
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.IdentityModel.Tokens.Jwt;
+#endif
 
 namespace FuelSDK
 {
@@ -28,6 +34,11 @@ namespace FuelSDK
         private string refreshKey = string.Empty;
         private DateTime authTokenExpiration = DateTime.Now;
         public static string SDKVersion = "FuelSDX-C#-V.91";
+
+#if !NET35
+        // Properties
+        internal Lazy<HttpClient> HttpClient { get; }
+#endif
 
         //Constructor
         public ET_Client(NameValueCollection parameters = null)
@@ -62,6 +73,15 @@ namespace FuelSDK
 
             if (clientId.Equals(string.Empty) || clientSecret.Equals(string.Empty))
                 throw new Exception("clientId or clientSecret is null: Must be provided in config file or passed when instantiating ET_Client");
+#if !NET35
+            HttpClient = new Lazy<HttpClient>(() =>
+            {
+                var client = new HttpClient();
+                client.DefaultRequestHeaders.UserAgent.Clear();
+                client.DefaultRequestHeaders.UserAgent.ParseAdd(SDKVersion);
+                return client;
+            });
+#endif
 
             //If JWT URL Parameter Used
             if (parameters != null && parameters.AllKeys.Contains("jwt"))
@@ -69,11 +89,22 @@ namespace FuelSDK
                 if (appSignature.Equals(string.Empty))
                     throw new Exception("Unable to utilize JWT for SSO without appSignature: Must be provided in config file or passed when instantiating ET_Client");
                 string encodedJWT = parameters["jwt"].ToString().Trim();
+#if NET35
                 String decodedJWT = JsonWebToken.Decode(encodedJWT, appSignature);
                 JObject parsedJWT = JObject.Parse(decodedJWT);
                 authToken = parsedJWT["request"]["user"]["oauthToken"].Value<string>().Trim();
                 authTokenExpiration = DateTime.Now.AddSeconds(int.Parse(parsedJWT["request"]["user"]["expiresIn"].Value<string>().Trim()));                
                 refreshKey = parsedJWT["request"]["user"]["refreshToken"].Value<string>().Trim();
+#else
+                JwtSecurityToken token = new JwtSecurityToken(encodedJWT);
+                JObject requestJObject = (JObject)token.Payload["request"];
+
+                authToken = requestJObject["user"]["oauthToken"].Value<string>().Trim();
+                authTokenExpiration = DateTime.Now.AddSeconds(int.Parse(requestJObject["user"]["expiresIn"].Value<string>().Trim()));
+                refreshKey = requestJObject["user"]["refreshToken"].Value<string>().Trim();
+
+                HttpClient.Value.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", authToken);
+#endif
             }
             else
             {
@@ -111,23 +142,22 @@ namespace FuelSDK
                 string strURL = "https://auth.exacttargetapis.com/v1/requestToken";
               
                 if (sandbox)
-                    strURL = "https://auth-test.exacttargetapis.com/v1/requestToken";                    
-                
+                    strURL = "https://auth-test.exacttargetapis.com/v1/requestToken";
 
+                string json;
+                if (refreshKey.Length > 0)
+                    json = @"{""clientId"": """ + clientId + @""", ""clientSecret"": """ + clientSecret + @""", ""refreshToken"": """ + refreshKey + @""",  ""accessType"": ""offline""}";
+                else
+                    json = @"{""clientId"": """ + clientId + @""", ""clientSecret"": """ + clientSecret + @"""}";
+#if NET35
                 //Build the request
                 HttpWebRequest request = (HttpWebRequest)WebRequest.Create(strURL.Trim());
                 request.Method = "POST";
                 request.ContentType = "application/json";
                 request.UserAgent = ET_Client.SDKVersion;
 
-                string json;
                 using (var streamWriter = new StreamWriter(request.GetRequestStream()))
                 {
-
-                    if (refreshKey.Length > 0)
-                        json = @"{""clientId"": """ + clientId + @""", ""clientSecret"": """ + clientSecret + @""", ""refreshToken"": """ + refreshKey + @""",  ""accessType"": ""offline""}";
-                    else
-                        json = @"{""clientId"": """ + clientId + @""", ""clientSecret"": """ + clientSecret + @"""}";
                     streamWriter.Write(json);
                 }
 
@@ -139,13 +169,29 @@ namespace FuelSDK
                 reader.Close();
                 dataStream.Close();
                 response.Close();
+#else
+                string responseFromServer;
+
+                using (HttpResponseMessage httpResponseMessage =
+                    HttpClient.Value.PostAsync(strURL, new StringContent(json, Encoding.UTF8, "application/json")).ConfigureAwait(false).GetAwaiter().GetResult())
+                {
+                    httpResponseMessage.EnsureSuccessStatusCode();
+                    using (HttpContent content = httpResponseMessage.Content)
+                    {
+                        responseFromServer = content.ReadAsStringAsync().ConfigureAwait(false).GetAwaiter().GetResult();
+                    }
+                }
+#endif
 
                 //Parse the response
                 JObject parsedResponse = JObject.Parse(responseFromServer);
                 authToken = parsedResponse["accessToken"].Value<string>().Trim();
                 authTokenExpiration = DateTime.Now.AddSeconds(int.Parse(parsedResponse["expiresIn"].Value<string>().Trim()));
                 if (parsedResponse["refreshToken"] != null)
-                    refreshKey = parsedResponse["refreshToken"].Value<string>().Trim();                
+                    refreshKey = parsedResponse["refreshToken"].Value<string>().Trim();
+#if !NET35
+                HttpClient.Value.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", authToken);
+#endif
             }
         }
 
@@ -211,8 +257,12 @@ namespace FuelSDK
             return xmlHeader;
         }
         public static HttpRequestMessageProperty BuildHTTPRequest() {
-            var httpRequest = new System.ServiceModel.Channels.HttpRequestMessageProperty();            
+            var httpRequest = new System.ServiceModel.Channels.HttpRequestMessageProperty();
+#if NET35
             httpRequest.Headers.Add(HttpRequestHeader.UserAgent, ET_Client.SDKVersion);
+#else
+            httpRequest.Headers[HttpRequestHeader.UserAgent] = ET_Client.SDKVersion;
+#endif
             return httpRequest;
         }
     }
@@ -393,6 +443,7 @@ namespace FuelSDK
                 }
             }
 
+#if NET35
             HttpWebRequest request = (HttpWebRequest)WebRequest.Create(completeURL.Trim());
             request.Method = "POST";
             request.ContentType = "application/json";
@@ -467,7 +518,66 @@ namespace FuelSDK
                     Message = reader.ReadToEnd();
                 }
             }
+#else
+            string jsonPayload = JsonConvert.SerializeObject(theObject);
 
+            try
+            {
+                using (HttpResponseMessage httpResponseMessage =
+                    theObject.AuthStub.HttpClient.Value.PostAsync(completeURL.Trim(), new StringContent(jsonPayload, Encoding.UTF8, "application/json")).ConfigureAwait(false).GetAwaiter().GetResult())
+                {
+                    string responseFromServer;
+                    using (HttpContent content = httpResponseMessage.Content)
+                    {
+                        responseFromServer = content.ReadAsStringAsync().ConfigureAwait(false).GetAwaiter().GetResult();
+                    }
+
+                    if (!httpResponseMessage.IsSuccessStatusCode)
+                    {
+                        this.Status = false;
+                        this.Results = new ResultDetail[] { };
+                        this.Message = responseFromServer;
+                        return;
+                    }
+
+                    this.Status = true;
+                    List<ResultDetail> AllResults = new List<ResultDetail>();
+
+                    ConstructorInfo constructor = theObject.GetType().GetConstructor(new[] { typeof(JObject) });
+
+                    if (responseFromServer.StartsWith("["))
+                    {
+                        JArray jsonArray = JArray.Parse(responseFromServer);
+                        foreach (JObject obj in jsonArray)
+                        {
+                            APIObject currentObject = (APIObject)constructor.Invoke(new object[] { obj });
+                            ResultDetail result = new ResultDetail();
+                            result.Object = currentObject;
+                            AllResults.Add(result);
+                        }
+
+                        this.Results = AllResults.ToArray();
+                    }
+                    else
+                    {
+                        JObject jsonObject = JObject.Parse(responseFromServer);
+                        ResultDetail result = new ResultDetail();
+                        APIObject currentObject = (APIObject)constructor.Invoke(new object[] { jsonObject });
+                        result.Object = currentObject;
+                        AllResults.Add(result);
+                        this.Results = AllResults.ToArray();
+                    }
+                }
+            }
+            catch (HttpRequestException httpRequestException)
+            {
+                this.Status = false;
+                this.Results = new ResultDetail[] { };
+                Message = httpRequestException.Message;
+                if (httpRequestException.InnerException != null)
+                    Message += ": " + httpRequestException.InnerException.Message;
+            }
+#endif
 
         }
 
@@ -644,6 +754,7 @@ namespace FuelSDK
 
         private void restDelete(FuelObject theObject, string url)
         {
+#if NET35
             //Build the request
             HttpWebRequest request = (HttpWebRequest)WebRequest.Create(url.Trim());
             request.Method = "DELETE";
@@ -687,6 +798,35 @@ namespace FuelSDK
                     this.Message = reader.ReadToEnd();
                 }
             }
+#else
+            try
+            {
+                using (HttpResponseMessage httpResponseMessage =
+                    theObject.AuthStub.HttpClient.Value.DeleteAsync(url.Trim()).ConfigureAwait(false).GetAwaiter().GetResult())
+                {
+                    if (!httpResponseMessage.IsSuccessStatusCode)
+                    {
+                        using (HttpContent content = httpResponseMessage.Content)
+                        {
+                            this.Message = content.ReadAsStringAsync().ConfigureAwait(false).GetAwaiter().GetResult();
+                        }
+
+                        this.Status = false;
+                        return;
+                    }
+
+                    this.Status = true;
+                }
+            }
+            catch (HttpRequestException httpRequestException)
+            {
+                this.Status = false;
+                this.Results = new ResultDetail[] { };
+                Message = httpRequestException.Message;
+                if (httpRequestException.InnerException != null)
+                    Message += ": " + httpRequestException.InnerException.Message;
+            }
+#endif
         }
     }
 
@@ -917,6 +1057,7 @@ namespace FuelSDK
 
         private void restGet(ref FuelObject theObject, string url)
         {
+#if NET35
             //Build the request
             HttpWebRequest request = (HttpWebRequest)WebRequest.Create(url.Trim());
             request.Method = "GET";
@@ -995,6 +1136,74 @@ namespace FuelSDK
                     this.Message = reader.ReadToEnd();
                 }
             }
+#else
+            try
+            {
+                using (HttpResponseMessage httpResponseMessage =
+                    theObject.AuthStub.HttpClient.Value.GetAsync(url.Trim()).ConfigureAwait(false).GetAwaiter().GetResult())
+                {
+                    string responseFromServer;
+                    using (HttpContent content = httpResponseMessage.Content)
+                    {
+                        responseFromServer = content.ReadAsStringAsync().ConfigureAwait(false).GetAwaiter().GetResult();
+                    }
+
+                    if (!httpResponseMessage.IsSuccessStatusCode)
+                    {
+                        this.Status = false;
+                        this.Message = responseFromServer;
+                        return;
+                    }
+
+                    this.Status = true;
+
+                    if (responseFromServer != null)
+                    {
+                        JObject parsedResponse = JObject.Parse(responseFromServer);
+                        //Check on the paging information from response
+                        if (parsedResponse["page"] != null)
+                        {
+                            this.LastPageNumber = int.Parse(parsedResponse["page"].Value<string>().Trim());
+                            int pageSize = int.Parse(parsedResponse["pageSize"].Value<string>().Trim());
+
+                            int count = -1;
+                            if (parsedResponse["count"] != null)
+                            {
+                                count = int.Parse(parsedResponse["count"].Value<string>().Trim());
+                            }
+                            else if (parsedResponse["totalCount"] != null)
+                            {
+                                count = int.Parse(parsedResponse["totalCount"].Value<string>().Trim());
+                            }
+
+                            if (count != -1 && (count > (this.LastPageNumber * pageSize)))
+                            {
+                                this.MoreResults = true;
+                            }
+                        }
+
+                        APIObject[] getResults = new APIObject[] { };
+
+                        if (parsedResponse["items"] != null)
+                            getResults = processResults(parsedResponse["items"].ToString().Trim(), theObject.GetType());
+                        else if (parsedResponse["entities"] != null)
+                            getResults = processResults(parsedResponse["entities"].ToString().Trim(), theObject.GetType());
+                        else
+                            getResults = processResults(responseFromServer.Trim(), theObject.GetType());
+
+                        this.Results = getResults.ToArray();
+                    }
+                }
+            }
+            catch (HttpRequestException httpRequestException)
+            {
+                this.Status = false;
+                this.Results = new APIObject[] {};
+                Message = httpRequestException.Message;
+                if (httpRequestException.InnerException != null)
+                    Message += ": " + httpRequestException.InnerException.Message;
+            }
+#endif
         }
 
         protected APIObject[] processResults(string restResponse, Type fuelType)
@@ -1010,7 +1219,11 @@ namespace FuelSDK
                         JArray jsonArray = JArray.Parse(restResponse.ToString());
                         foreach (JObject obj in jsonArray)
                         {
+#if NET35
                             APIObject currentObject = (APIObject)Activator.CreateInstance(fuelType, System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance, null, new object[] { obj }, null);
+#else
+                            APIObject currentObject = (APIObject)Activator.CreateInstance(fuelType, new object[] { obj });
+#endif
                             allObjects.Add(currentObject);
                         }
 
@@ -1020,7 +1233,11 @@ namespace FuelSDK
                     {
                         JObject jsonObject = JObject.Parse(restResponse.ToString());
                         ResultDetail result = new ResultDetail();
+#if NET35
                         APIObject currentObject = (APIObject)Activator.CreateInstance(fuelType, System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance, null, new object[] { jsonObject }, null);
+#else
+                        APIObject currentObject = (APIObject)Activator.CreateInstance(fuelType, new object[] { jsonObject });
+#endif
                         allObjects.Add(currentObject);
                         return allObjects.ToArray();
                     }
@@ -1186,7 +1403,11 @@ namespace FuelSDK
 
                 foreach (PropertyInfo prop in inputObject.GetType().GetProperties())
                 {
+#if NET35
                     if ((prop.PropertyType.IsSubclassOf(typeof(APIObject)) || prop.PropertyType == typeof(APIObject)) && prop.GetValue(inputObject, null) != null)
+#else
+                    if ((prop.PropertyType.GetTypeInfo().IsSubclassOf(typeof(APIObject)) || prop.PropertyType == typeof(APIObject)) && prop.GetValue(inputObject, null) != null)
+#endif
                     {
                         prop.SetValue(returnObject, this.TranslateObject(prop.GetValue(inputObject, null)), null);
                     }
